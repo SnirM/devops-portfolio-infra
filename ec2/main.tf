@@ -1,53 +1,163 @@
-provider "aws" {
-  region = "ap-south-1"
+terraform {
+  required_version = ">= 1.4.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
 }
 
+provider "aws" {
+  region = var.region
+}
+
+# --------------------------
+# Network (Default VPC/Subnet for simplicity)
+# --------------------------
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default_vpc_subnets" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
+# Pick first subnet (OK for lab)
+locals {
+  subnet_id = data.aws_subnets.default_vpc_subnets.ids[0]
+}
+
+# --------------------------
+# Security Group: 22 + 80 inbound, all outbound
+# --------------------------
 resource "aws_security_group" "app_sg" {
   name        = "devops-portfolio-sg"
-  description = "Allow HTTP"
+  description = "Allow SSH and HTTP"
+  vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
+    description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
+    description = "All outbound"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = {
+    Name = "devops-portfolio-sg"
+  }
 }
 
+# --------------------------
+# IAM Role for EC2:
+# - Pull from ECR
+# - Use SSM (optional but recommended)
+# --------------------------
+data "aws_iam_policy_document" "ec2_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ec2_role" {
+  name               = "devops-portfolio-ec2-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_readonly" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "devops-portfolio-ec2-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+# --------------------------
+# EC2 Instance
+# --------------------------
 resource "aws_instance" "app" {
-  ami           = var.ami_id
-  instance_type = "t3.micro"
-  security_groups = [aws_security_group.app_sg.name]
+  ami                    = var.ami_id
+  instance_type          = var.instance_type
+  subnet_id              = local.subnet_id
+  vpc_security_group_ids = [aws_security_group.app_sg.id]
+
+  # Optional: if you created a Key Pair in AWS, put its name in variables.tf or tfvars.
+  # If you leave it empty, it will be null and Terraform will not set key_name.
+  key_name = var.key_name != "" ? var.key_name : null
+
+  associate_public_ip_address = true
+
+  iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
 
   user_data = <<-EOF
     #!/bin/bash
+    set -e
+
+    exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+    echo "=== Updating OS ==="
     yum update -y
+
+    echo "=== Installing docker ==="
     amazon-linux-extras install docker -y
-    service docker start
-    usermod -a -G docker ec2-user
 
-    aws ecr get-login-password --region ap-south-1 \
-    | docker login --username AWS --password-stdin ${var.ecr_repo}
+    echo "=== Enabling + starting docker ==="
+    systemctl enable docker
+    systemctl start docker
 
-    docker run -d -p 80:8000 ${var.ecr_repo}:latest
+    echo "=== Waiting for docker to be ready ==="
+    for i in {1..30}; do
+      docker info && break
+      echo "Docker not ready yet... retry $i"
+      sleep 2
+    done
+
+    echo "=== Login to ECR ==="
+    aws ecr get-login-password --region ${var.region} | docker login --username AWS --password-stdin ${var.ecr_registry}
+
+    echo "=== Pulling image ==="
+    docker pull ${var.ecr_repo}:latest
+
+    echo "=== Running container (host 80 -> container 8000) ==="
+    docker rm -f devops-portfolio-app || true
+    docker run -d --restart=always --name devops-portfolio-app -p 80:8000 ${var.ecr_repo}:latest
+
+    echo "=== Done ==="
   EOF
 
   tags = {
     Name = "devops-portfolio-ec2"
   }
 }
-
