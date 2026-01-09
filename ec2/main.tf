@@ -13,9 +13,9 @@ provider "aws" {
   region = var.region
 }
 
-# --------------------------
-# Network (Default VPC/Subnet for simplicity)
-# --------------------------
+# ----------------------------
+# Network (Default VPC/Subnet)
+# ----------------------------
 data "aws_vpc" "default" {
   default = true
 }
@@ -27,14 +27,13 @@ data "aws_subnets" "default_vpc_subnets" {
   }
 }
 
-# Pick first subnet (OK for lab)
 locals {
   subnet_id = data.aws_subnets.default_vpc_subnets.ids[0]
 }
 
-# --------------------------
-# Security Group: 22 + 80 inbound, all outbound
-# --------------------------
+# ----------------------------
+# Security Group: 22 + 80 inbound
+# ----------------------------
 resource "aws_security_group" "app_sg" {
   name        = "devops-portfolio-sg"
   description = "Allow SSH and HTTP"
@@ -69,14 +68,13 @@ resource "aws_security_group" "app_sg" {
   }
 }
 
-# --------------------------
-# IAM Role for EC2:
-# - Pull from ECR
-# - Use SSM (optional but recommended)
-# --------------------------
+# ----------------------------
+# IAM Role for EC2 (ECR pull + SSM)
+# ----------------------------
 data "aws_iam_policy_document" "ec2_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
+
     principals {
       type        = "Service"
       identifiers = ["ec2.amazonaws.com"]
@@ -104,22 +102,25 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   role = aws_iam_role.ec2_role.name
 }
 
-# --------------------------
-# EC2 Instance
-# --------------------------
+# ----------------------------
+# EC2 Instance (runs container via user_data)
+# ----------------------------
 resource "aws_instance" "app" {
-  ami                    = var.ami_id
-  instance_type          = var.instance_type
-  subnet_id              = local.subnet_id
-  vpc_security_group_ids = [aws_security_group.app_sg.id]
+  ami           = var.ami_id
+  instance_type = var.instance_type
+  subnet_id     = local.subnet_id
 
-  # Optional: if you created a Key Pair in AWS, put its name in variables.tf or tfvars.
-  # If you leave it empty, it will be null and Terraform will not set key_name.
-  key_name = var.key_name != "" ? var.key_name : null
-
+  vpc_security_group_ids      = [aws_security_group.app_sg.id]
   associate_public_ip_address = true
 
+  # Optional: if you create a Key Pair, put its name in terraform.tfvars
+  # If empty, Terraform won't set key_name (SSM only).
+  key_name = var.key_name != "" ? var.key_name : null
+
   iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
+
+  # Force replace instance if user_data changes (so it reruns)
+  user_data_replace_on_change = true
 
   user_data = <<-EOF
     #!/bin/bash
@@ -127,30 +128,33 @@ resource "aws_instance" "app" {
 
     exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 
-    echo "=== Updating OS ==="
+    echo "=== Update OS ==="
     yum update -y
 
-    echo "=== Installing docker ==="
+    echo "=== Install Docker ==="
     amazon-linux-extras install docker -y
-
-    echo "=== Enabling + starting docker ==="
     systemctl enable docker
     systemctl start docker
 
-    echo "=== Waiting for docker to be ready ==="
-    for i in {1..30}; do
-      docker info && break
-      echo "Docker not ready yet... retry $i"
-      sleep 2
-    done
+    echo "=== Ensure SSM Agent ==="
+    systemctl enable amazon-ssm-agent || true
+    systemctl restart amazon-ssm-agent || true
+
+    echo "=== Install AWS CLI v2 (required for get-login-password) ==="
+    yum install -y unzip curl
+    cd /tmp
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    unzip -o awscliv2.zip
+    ./aws/install --update
 
     echo "=== Login to ECR ==="
+    aws --version
     aws ecr get-login-password --region ${var.region} | docker login --username AWS --password-stdin ${var.ecr_registry}
 
-    echo "=== Pulling image ==="
+    echo "=== Pull Image ==="
     docker pull ${var.ecr_repo}:latest
 
-    echo "=== Running container (host 80 -> container 8000) ==="
+    echo "=== Run container (host 80 -> container 8000) ==="
     docker rm -f devops-portfolio-app || true
     docker run -d --restart=always --name devops-portfolio-app -p 80:8000 ${var.ecr_repo}:latest
 
