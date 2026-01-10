@@ -13,9 +13,9 @@ provider "aws" {
   region = var.region
 }
 
-# ----------------------------
-# Network (Default VPC/Subnet)
-# ----------------------------
+# ---------------------------
+# Network (Default VPC/Subnet for simplicity)
+# ---------------------------
 data "aws_vpc" "default" {
   default = true
 }
@@ -31,9 +31,9 @@ locals {
   subnet_id = data.aws_subnets.default_vpc_subnets.ids[0]
 }
 
-# ----------------------------
-# Security Group: 22 + 80 inbound
-# ----------------------------
+# ---------------------------
+# Security Group: 22 + 80 inbound, all outbound
+# ---------------------------
 resource "aws_security_group" "app_sg" {
   name        = "devops-portfolio-sg"
   description = "Allow SSH and HTTP"
@@ -68,13 +68,14 @@ resource "aws_security_group" "app_sg" {
   }
 }
 
-# ----------------------------
-# IAM Role for EC2 (ECR pull + SSM)
-# ----------------------------
+# ---------------------------
+# IAM Role for EC2:
+# - Pull from ECR
+# - Use SSM (recommended)
+# ---------------------------
 data "aws_iam_policy_document" "ec2_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
-
     principals {
       type        = "Service"
       identifiers = ["ec2.amazonaws.com"]
@@ -89,12 +90,12 @@ resource "aws_iam_role" "ec2_role" {
 
 resource "aws_iam_role_policy_attachment" "ecr_readonly" {
   role       = aws_iam_role.ec2_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  policy_arn  = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
 resource "aws_iam_role_policy_attachment" "ssm_core" {
   role       = aws_iam_role.ec2_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  policy_arn  = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_instance_profile" "ec2_profile" {
@@ -102,25 +103,20 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   role = aws_iam_role.ec2_role.name
 }
 
-# ----------------------------
-# EC2 Instance (runs container via user_data)
-# ----------------------------
+# ---------------------------
+# EC2 Instance
+# ---------------------------
 resource "aws_instance" "app" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
-  subnet_id     = local.subnet_id
-
+  ami                         = var.ami_id
+  instance_type               = var.instance_type
+  subnet_id                   = local.subnet_id
   vpc_security_group_ids      = [aws_security_group.app_sg.id]
   associate_public_ip_address = true
 
-  # Optional: if you create a Key Pair, put its name in terraform.tfvars
-  # If empty, Terraform won't set key_name (SSM only).
+  # אם אתה משתמש ב-SSM בלבד, תשאיר key_name ריק (default = "")
   key_name = var.key_name != "" ? var.key_name : null
 
   iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
-
-  # Force replace instance if user_data changes (so it reruns)
-  user_data_replace_on_change = true
 
   user_data = <<-EOF
     #!/bin/bash
@@ -128,33 +124,39 @@ resource "aws_instance" "app" {
 
     exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 
-    echo "=== Update OS ==="
+    echo "=== Updating OS ==="
     yum update -y
 
-    echo "=== Install Docker ==="
+    echo "=== Installing tools (curl, unzip) ==="
+    yum install -y curl unzip
+
+    echo "=== Installing AWS CLI v2 (needed for get-login-password) ==="
+    curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+    unzip -q /tmp/awscliv2.zip -d /tmp
+    /tmp/aws/install || true
+
+    echo "=== Installing Docker ==="
     amazon-linux-extras install docker -y
+
+    echo "=== Enable & start Docker ==="
     systemctl enable docker
     systemctl start docker
 
-    echo "=== Ensure SSM Agent ==="
-    systemctl enable amazon-ssm-agent || true
-    systemctl restart amazon-ssm-agent || true
-
-    echo "=== Install AWS CLI v2 (required for get-login-password) ==="
-    yum install -y unzip curl
-    cd /tmp
-    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-    unzip -o awscliv2.zip
-    ./aws/install --update
+    echo "=== Waiting for docker to be ready ==="
+    for i in {1..30}; do
+      docker info && break
+      echo "Docker not ready yet... retry $i"
+      sleep 2
+    done
 
     echo "=== Login to ECR ==="
     aws --version
     aws ecr get-login-password --region ${var.region} | docker login --username AWS --password-stdin ${var.ecr_registry}
 
-    echo "=== Pull Image ==="
+    echo "=== Pulling image ==="
     docker pull ${var.ecr_repo}:latest
 
-    echo "=== Run container (host 80 -> container 8000) ==="
+    echo "=== Running container (host 80 -> container 8000) ==="
     docker rm -f devops-portfolio-app || true
     docker run -d --restart=always --name devops-portfolio-app -p 80:8000 ${var.ecr_repo}:latest
 
