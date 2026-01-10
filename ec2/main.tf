@@ -69,12 +69,11 @@ resource "aws_security_group" "app_sg" {
 }
 
 # -------------------------
-# IAM Role for EC2 (ECR pull + SSM)
+# IAM Role for EC2: ECR pull + SSM
 # -------------------------
 data "aws_iam_policy_document" "ec2_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
-
     principals {
       type        = "Service"
       identifiers = ["ec2.amazonaws.com"]
@@ -107,46 +106,42 @@ resource "aws_iam_instance_profile" "ec2_profile" {
 # -------------------------
 resource "aws_instance" "app" {
   ami                    = var.ami_id
-  instance_type          = var.instance_type
-  subnet_id              = local.subnet_id
-  vpc_security_group_ids = [aws_security_group.app_sg.id]
-
+  instance_type           = var.instance_type
+  subnet_id               = local.subnet_id
+  vpc_security_group_ids  = [aws_security_group.app_sg.id]
   associate_public_ip_address = true
 
-  # אם אתה עובד רק עם SSM - תשאיר key_name ריק ב-variables/tfvars (ברירת מחדל "")
-  key_name = var.key_name != "" ? var.key_name : null
-
   iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
+
+  # Optional: if you created a Key Pair in AWS, put its name in terraform.tfvars.
+  key_name = var.key_name != "" ? var.key_name : null
 
   user_data = <<-EOF
     #!/bin/bash
     set -e
 
-    exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+    exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
 
     echo "=== Updating OS ==="
     yum update -y
 
-    echo "=== Installing Docker ==="
-    amazon-linux-extras install docker -y
+    echo "=== Installing docker ==="
+    amazon-linux-extras install docker -y || yum install -y docker
 
-    echo "=== Starting Docker ==="
-    service docker start
+    echo "=== Starting docker ==="
+    service docker start || systemctl start docker
+    systemctl enable docker || true
 
-    echo "=== Waiting for Docker daemon ==="
-    for i in {1..30}; do
-      docker info && break
-      echo "Docker not ready yet... retry $i"
-      sleep 2
-    done
+    echo "=== Installing AWS CLI (if missing) ==="
+    command -v aws >/dev/null 2>&1 || yum install -y awscli
 
     echo "=== Login to ECR ==="
     aws ecr get-login-password --region ${var.region} | docker login --username AWS --password-stdin ${var.ecr_registry}
 
-    echo "=== Pull image ==="
+    echo "=== Pulling image ==="
     docker pull ${var.ecr_repo}:latest
 
-    echo "=== Run container (host 80 -> container 8000) ==="
+    echo "=== Running container on port 80 -> 8000 ==="
     docker rm -f devops-portfolio-app || true
     docker run -d --restart=always --name devops-portfolio-app -p 80:8000 ${var.ecr_repo}:latest
 
